@@ -1,100 +1,84 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
-	"io"
-	"log"
+	"golang.org/x/sys/windows"
+	"golang.zx2c4.com/wintun"
 	"net"
+	"os"
 )
 
-func main() {
-	// Start TCP server
-	tcpListener, err := net.Listen("tcp", "localhost:8777")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer tcpListener.Close()
+var REMOTE = "95.217.146.251"
 
-	// Start ICMP listener
-	icmpConn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer icmpConn.Close()
+// calculate checksum for ip package
+func CalculateIPv4Checksum(bytes []byte) uint16 {
+	// Clear checksum bytes
+	bytes[10] = 0
+	bytes[11] = 0
 
-	for {
-		// Accept incoming connections
-		conn, err := tcpListener.Accept()
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		go handleConnection(conn, icmpConn)
+	// Compute checksum
+	var csum uint32
+	for i := 0; i < len(bytes); i += 2 {
+		csum += uint32(bytes[i]) << 8
+		csum += uint32(bytes[i+1])
 	}
+
+	for csum > 0xFFFF {
+		csum = (csum >> 16) + uint32(uint16(csum))
+	}
+	return ^uint16(csum)
 }
 
-func handleConnection(conn net.Conn, icmpConn *icmp.PacketConn) {
-	defer conn.Close()
-
-	// Create buffer to read data from the connection
-	buf := make([]byte, 4096)
-
-	// Loop to handle multiple packets
+// Read outcoming packets (from user) and send to remote
+func Read(session wintun.Session) (int, error) {
+	buf := make([]byte, 65555)
 	for {
-		// Read data from the connection
-		n, err := conn.Read(buf)
-		if err != nil {
-			if err == io.EOF {
-				break // Connection closed, exit the loop
+		packet, err := session.ReceivePacket()
+		switch err {
+		case nil:
+			header, _ := ipv4.ParseHeader(packet)
+			copy(buf[:header.TotalLen], packet)
+			session.ReleaseReceivePacket(packet)
+			fmt.Println(header)
+			if header.Protocol == 6 {
+				m := icmp.Message{
+					Type: ipv4.ICMPTypeEcho, Code: 255,
+					Body: &icmp.Echo{
+						ID: os.Getpid() & 0xffff, Seq: 1, //<< uint(seq), // TODO
+						Data: buf[header.Len:header.TotalLen],
+					},
+				}
+				b, _ := m.Marshal(nil)
+				conn, err := net.DialIP("ip4:icmp", nil, &net.IPAddr{IP: net.IPv4(95, 217, 146, 251)})
+				if err != nil {
+					fmt.Printf("Dial failed: %w \n", err)
+				}
+				_, err = conn.Write(b)
+				if err != nil {
+					fmt.Printf("Send failed: %w \n", err)
+				}
 			}
-			log.Fatal(err)
-		}
 
-		// Create ICMP message
-		dst, err := net.ResolveIPAddr("ip4", "172.17.200.86")
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		msg := icmp.Message{
-			Type: ipv4.ICMPTypeEcho, Code: 255,
-			Body: &icmp.Echo{
-				ID: 0x1234, Seq: 1,
-				Data: buf[:n],
-			},
-		}
-
-		bytes, err := msg.Marshal(nil)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		// Send ICMP message
-		if _, err := icmpConn.WriteTo(bytes, dst); err != nil {
-			log.Fatal(err)
-		}
-
-		// Listen for ICMP echo reply
-		buf2 := make([]byte, 4096)
-		n, _, err = icmpConn.ReadFrom(buf2)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		msg_r, err := icmp.ParseMessage(ipv4.ICMPTypeEchoReply.Protocol(), buf2[:n])
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		echo, ok := msg_r.Body.(*icmp.Echo)
-		if !ok {
-			log.Fatal("got wrong message body type in echo reply")
-		}
-
-		// Send the data as a TCP packet
-		if _, err := conn.Write(echo.Data); err != nil {
-			log.Fatal(err)
+		case windows.ERROR_NO_MORE_ITEMS:
+			continue
+		case windows.ERROR_HANDLE_EOF:
+			return 0, os.ErrClosed
+		case windows.ERROR_INVALID_DATA:
+			return 0, errors.New("Send ring corrupt")
 		}
 	}
+}
+func main() {
+	adapter, _ := wintun.CreateAdapter("MyAdapter", "wintun", nil)
+	session, _ := adapter.StartSession(0x800000)
+	_, err := Read(session)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	adapter.Close()
+
 }
