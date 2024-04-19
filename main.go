@@ -13,7 +13,7 @@ import (
 
 var REMOTE = "95.217.146.251"
 
-// calculate checksum for ip package
+// CalculateIPv4Checksum calculate checksum for ip package
 func CalculateIPv4Checksum(bytes []byte) uint16 {
 	// Clear checksum bytes
 	bytes[10] = 0
@@ -54,11 +54,11 @@ func Read(session wintun.Session) (int, error) {
 				b, _ := m.Marshal(nil)
 				conn, err := net.DialIP("ip4:icmp", nil, &net.IPAddr{IP: net.IPv4(95, 217, 146, 251)})
 				if err != nil {
-					fmt.Printf("Dial failed: %w \n", err)
+					fmt.Printf("Dial failed: %v \n", err)
 				}
 				_, err = conn.Write(b)
 				if err != nil {
-					fmt.Printf("Send failed: %w \n", err)
+					fmt.Printf("Send failed: %v \n", err)
 				}
 			}
 
@@ -71,10 +71,62 @@ func Read(session wintun.Session) (int, error) {
 		}
 	}
 }
+
+func Write(session wintun.Session) (int, error) {
+
+	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+
+	if err != nil {
+		fmt.Printf("Listen ICMP failed: %v \n", err)
+	}
+	buf := make([]byte, 65555)
+	for {
+		if err != nil {
+			return 0, err
+		}
+		n, addr, err := conn.ReadFrom(buf)
+		fmt.Println(string(buf[:n]))
+		if err != nil {
+			fmt.Printf("Read failed: %v \n", err)
+		}
+		packet, err := session.AllocateSendPacket(1500)
+		if err != nil {
+			fmt.Printf("Allocate failed: %v \n", err)
+		}
+
+		header := &ipv4.Header{
+			Version:  4,
+			TOS:      0,
+			Len:      20,
+			TotalLen: len(buf[:n]) + 20,
+			TTL:      64,
+			Protocol: 6,
+			Src:      addr.(*net.IPAddr).IP,
+			Dst:      net.IPv4(0, 0, 0, 0),
+		}
+		header.Checksum = int(CalculateIPv4Checksum(packet))
+		b, err := header.Marshal()
+		if err != nil {
+			fmt.Printf("Marshal failed: %v \n", err)
+		}
+		res := append(b, buf[:n]...)
+		session.SendPacket(res)
+
+	}
+
+}
+
 func main() {
 	adapter, _ := wintun.CreateAdapter("MyAdapter", "wintun", nil)
 	session, _ := adapter.StartSession(0x800000)
-	_, err := Read(session)
+	go func() {
+		_, err := Read(session)
+		if err != nil {
+			fmt.Println(err)
+		}
+	}()
+	_, err := Write(session)
+
 	if err != nil {
 		fmt.Println(err)
 	}
